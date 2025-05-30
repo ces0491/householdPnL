@@ -1,0 +1,6 @@
+﻿services:
+  - type: web
+    name: bank-statement-analyzer
+    env: static
+    buildCommand: npm install && npm run build
+    staticPublishPath: ./build
