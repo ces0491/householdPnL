@@ -31,10 +31,37 @@ const EXPENSE_CATEGORIES = {
   'Other': []
 };
 
-const INCOME_KEYWORDS = ['CASHFOCUS SALARY', 'PRECISE DIGIT', 'TOBIAS', 'salary', 'bonus'];
+const INCOME_KEYWORDS = [
+  // Salary/Employment
+  'SALARY', 'WAGES', 'PAY', 'PAYROLL', 'EMPLOYEE', 'EMPLOYER',
+  
+  // Business/Freelance
+  'PAYMENT', 'INVOICE', 'CLIENT', 'CONTRACT', 'FREELANCE', 'CONSULTING',
+  'TRANSFER', 'DEPOSIT', 'CREDIT',
+  
+  // Investment/Returns
+  'DIVIDEND', 'INTEREST', 'RETURN', 'INVESTMENT', 'PROFIT',
+  
+  // Government/Benefits
+  'SASSA', 'UIF', 'GRANT', 'PENSION', 'REFUND',
+  
+  // Common SA company indicators
+  'PTY', 'LTD', 'CC', 'PROPRIETARY', 'LIMITED',
+  
+  // Generic positive transaction indicators
+  'INWARD', 'INCOMING', 'RECEIPT', 'RECEIVED'
+];
 
 // Inter-account transfer keywords to exclude from income
-const TRANSFER_KEYWORDS = ['Ces - ib transfer', 'JACKIE', 'INT ACNT TRF', 'FUND TRANSFERS', 'ib payment', 'ib transfer', 'Ces -', 'Ces MARSH'];
+const TRANSFER_KEYWORDS = [
+  'TRANSFER', 'TRF', 'TFRF', 'TRANSF',
+  'IB PAYMENT', 'IB TRANSFER', 'INTERNET BANKING',
+  'INT ACNT', 'INTERNAL', 'INTER ACCOUNT',
+  'FUND TRANSFER', 'FUNDS TRANSFER',
+  'OWN ACCOUNT', 'BETWEEN ACCOUNTS',
+  'PAYMENT TO', 'PAYMENT FROM',
+  'DEBIT ORDER REVERSAL', 'CREDIT REVERSAL'
+];
 
 const BankStatementAnalyzer = () => {
   const [statements, setStatements] = useState([]);
@@ -80,8 +107,28 @@ const BankStatementAnalyzer = () => {
   // Check if transaction is income (excluding inter-account transfers)
   const isIncome = useCallback((description, amount) => {
     const desc = description.toUpperCase();
+    
+    // First check if it's a transfer - if so, not income
     if (isInterAccountTransfer(description)) return false;
-    return amount > 0 && INCOME_KEYWORDS.some(keyword => desc.includes(keyword.toUpperCase()));
+    
+    // If amount is negative, definitely not income
+    if (amount <= 0) return false;
+    
+    // Check for explicit income keywords
+    const hasIncomeKeyword = INCOME_KEYWORDS.some(keyword => desc.includes(keyword.toUpperCase()));
+    if (hasIncomeKeyword) return true;
+    
+    // For positive amounts without clear expense indicators, assume income
+    // This helps catch salary payments, client payments, etc. that might not match keywords
+    const expenseIndicators = ['FEE', 'CHARGE', 'DEBIT', 'WITHDRAWAL', 'PURCHASE', 'BUY', 'SHOP'];
+    const hasExpenseIndicator = expenseIndicators.some(keyword => desc.includes(keyword));
+    
+    // If it's a positive amount > R100 without expense indicators, likely income
+    if (amount > 100 && !hasExpenseIndicator) {
+      return true;
+    }
+    
+    return false;
   }, [isInterAccountTransfer]);
 
   // Add manual entry
@@ -126,52 +173,68 @@ const BankStatementAnalyzer = () => {
 
   // Parse transactions from extracted PDF text
   const parseTransactionsFromText = useCallback((text) => {
+    console.log('=== PDF PARSING DEBUG ===');
+    console.log('Extracted text length:', text.length);
+    console.log('First 500 characters:', text.substring(0, 500));
+    
     const transactions = [];
     const lines = text.split('\n').filter(line => line.trim());
+    console.log('Total lines:', lines.length);
     
-    // Common date patterns for South African bank statements
+    // Enhanced date patterns for South African banks
     const datePatterns = [
-      /(\d{2}[-\/]\d{2}[-\/]\d{4})/g,  // DD/MM/YYYY or DD-MM-YYYY
-      /(\d{4}[-\/]\d{2}[-\/]\d{2})/g,  // YYYY/MM/DD or YYYY-MM-DD
-      /(\d{2}\s\w{3}\s\d{4})/g         // DD MMM YYYY
+      /(\d{1,2}[-\/]\d{1,2}[-\/]\d{4})/g,     // DD/MM/YYYY or D/M/YYYY
+      /(\d{4}[-\/]\d{1,2}[-\/]\d{1,2})/g,     // YYYY/MM/DD or YYYY/M/D
+      /(\d{1,2}\s\w{3}\s\d{4})/g,             // DD MMM YYYY or D MMM YYYY
+      /(\w{3}\s\d{1,2},?\s\d{4})/g,           // MMM DD, YYYY
+      /(\d{1,2}\s\w+\s\d{4})/g                // DD Month YYYY
     ];
 
-    // Amount patterns (South African format)
+    // Enhanced amount patterns for SA banking
     const amountPatterns = [
-      /([\-\+]?\s?R?\s?\d{1,3}(?:[\s,]\d{3})*(?:\.\d{2})?)/g,
-      /([\-\+]?\s?\d{1,3}(?:[\s,]\d{3})*(?:\.\d{2})?)/g
+      /([\-\+]?\s*R\s*\d{1,3}(?:[,\s]\d{3})*(?:\.\d{2})?)/gi,     // R1,234.56 or R 1 234.56
+      /([\-\+]?\s*\d{1,3}(?:[,\s]\d{3})*\.\d{2})/g,               // 1,234.56 or 1 234.56
+      /([\-\+]?\s*\d{1,6}\.\d{2})/g,                               // Simple 1234.56
+      /(\d{1,3}(?:[,\s]\d{3})*(?:\.\d{2})?\s*(?:CR|DR))/gi        // 1,234.56 CR/DR
     ];
+
+    let debugInfo = [];
 
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i].trim();
-      if (!line) continue;
+      if (!line || line.length < 5) continue;
 
       // Look for date patterns
       let dateMatch = null;
-      let matchedDatePattern = null;
+      let matchedPattern = null;
       
-      for (const pattern of datePatterns) {
+      for (let p = 0; p < datePatterns.length; p++) {
+        const pattern = datePatterns[p];
         const match = line.match(pattern);
         if (match) {
           dateMatch = match[0];
-          matchedDatePattern = pattern;
+          matchedPattern = p;
           break;
         }
       }
 
       if (dateMatch) {
+        debugInfo.push(`Line ${i}: Found date "${dateMatch}" in: ${line}`);
+        
         // Parse the date to standard format
         let parsedDate = '';
         try {
-          if (matchedDatePattern === datePatterns[0]) {
-            // DD/MM/YYYY or DD-MM-YYYY
+          if (matchedPattern === 0) {
+            // DD/MM/YYYY or D/M/YYYY
             const parts = dateMatch.split(/[-\/]/);
-            parsedDate = `${parts[2]}-${parts[1].padStart(2, '0')}-${parts[0].padStart(2, '0')}`;
-          } else if (matchedDatePattern === datePatterns[1]) {
-            // YYYY/MM/DD or YYYY-MM-DD
+            if (parts.length === 3) {
+              parsedDate = `${parts[2]}-${parts[1].padStart(2, '0')}-${parts[0].padStart(2, '0')}`;
+            }
+          } else if (matchedPattern === 1) {
+            // YYYY/MM/DD
             parsedDate = dateMatch.replace(/[\/]/g, '-');
-          } else if (matchedDatePattern === datePatterns[2]) {
-            // DD MMM YYYY
+          } else {
+            // Try to parse as a date directly
             const date = new Date(dateMatch);
             if (!isNaN(date)) {
               parsedDate = date.toISOString().split('T')[0];
@@ -182,54 +245,71 @@ const BankStatementAnalyzer = () => {
           continue;
         }
 
-        if (!parsedDate) continue;
+        if (!parsedDate) {
+          debugInfo.push(`Failed to parse date: ${dateMatch}`);
+          continue;
+        }
 
-        // Look for amounts in this line and next few lines
-        const searchLines = [line, ...lines.slice(i + 1, i + 4)];
+        // Look for amounts in this line and surrounding lines
+        const searchLines = [line, ...lines.slice(i + 1, i + 3), ...lines.slice(Math.max(0, i - 1), i)];
         let description = '';
         let amount = 0;
         let foundAmount = false;
+        let amountString = '';
 
         for (const searchLine of searchLines) {
-          // Extract description (everything except amounts)
-          let cleanLine = searchLine.replace(dateMatch, '').trim();
+          let workingLine = searchLine.replace(dateMatch, '').trim();
           
           for (const amountPattern of amountPatterns) {
-            const amountMatches = cleanLine.match(amountPattern);
+            const amountMatches = workingLine.match(amountPattern);
             if (amountMatches && !foundAmount) {
               for (const amountStr of amountMatches) {
                 // Clean and parse amount
                 let cleanAmount = amountStr
-                  .replace(/[R\s]/g, '')
-                  .replace(/,/g, '')
-                  .replace(/\s+/g, '');
+                  .replace(/[R\s]/gi, '')
+                  .replace(/[,\s]/g, '')
+                  .replace(/CR$/i, '')
+                  .replace(/DR$/i, '');
+                
+                // Handle negative amounts (DR or explicit -)
+                let isNegative = /DR$/i.test(amountStr) || amountStr.includes('-');
                 
                 const numericAmount = parseFloat(cleanAmount);
-                if (!isNaN(numericAmount) && Math.abs(numericAmount) > 0.01) {
-                  amount = numericAmount;
+                if (!isNaN(numericAmount) && numericAmount > 0) {
+                  amount = isNegative ? -numericAmount : numericAmount;
                   foundAmount = true;
+                  amountString = amountStr;
                   
                   // Remove amount from description
-                  cleanLine = cleanLine.replace(amountStr, '').trim();
+                  workingLine = workingLine.replace(amountStr, '').trim();
                   break;
                 }
               }
             }
           }
           
-          // Build description
-          if (cleanLine && cleanLine.length > 2) {
-            description += (description ? ' ' : '') + cleanLine;
+          // Build description from non-amount text
+          if (workingLine && workingLine.length > 2) {
+            // Clean up common bank statement artifacts
+            workingLine = workingLine
+              .replace(/\s+/g, ' ')
+              .replace(/^\s*[:\-\*\.]+\s*/, '')
+              .replace(/\s*[:\-\*\.]+\s*$/, '')
+              .trim();
+              
+            if (workingLine.length > 2) {
+              description += (description ? ' ' : '') + workingLine;
+            }
           }
           
-          if (foundAmount) break;
+          if (foundAmount && description) break;
         }
 
         // Only add transaction if we found both description and amount
         if (foundAmount && description && description.length > 3) {
           const transaction = {
             date: parsedDate,
-            description: description.trim(),
+            description: description.trim().substring(0, 100), // Limit description length
             amount: amount,
             type: amount >= 0 ? 'credit' : 'debit',
             category: isIncome(description, amount) ? 'Income' : categorizeTransaction(description),
@@ -238,16 +318,17 @@ const BankStatementAnalyzer = () => {
           };
           
           transactions.push(transaction);
+          debugInfo.push(`Created transaction: ${parsedDate} | ${description.substring(0, 30)}... | ${amount} | ${amountString}`);
+        } else {
+          debugInfo.push(`Skipped line ${i}: date=${dateMatch}, description="${description}", amount=${amount}, foundAmount=${foundAmount}`);
         }
       }
     }
 
-    // Remove obvious duplicates and invalid entries
+    // Remove duplicates
     const cleanedTransactions = transactions.filter((t, index, self) => {
-      // Remove transactions with amounts too small
       if (Math.abs(t.amount) < 0.01) return false;
       
-      // Remove obvious duplicates
       const duplicate = self.findIndex(other => 
         other.date === t.date && 
         other.description === t.description && 
@@ -256,6 +337,11 @@ const BankStatementAnalyzer = () => {
       
       return duplicate === index;
     });
+
+    console.log('Debug info:', debugInfo);
+    console.log('Raw transactions found:', transactions.length);
+    console.log('Cleaned transactions:', cleanedTransactions.length);
+    console.log('Sample transactions:', cleanedTransactions.slice(0, 3));
 
     return cleanedTransactions;
   }, [categorizeTransaction, isIncome, isInterAccountTransfer]);
@@ -639,6 +725,38 @@ const BankStatementAnalyzer = () => {
                       <CheckCircle className="w-5 h-5 text-green-500" />
                     </div>
                   ))}
+                </div>
+                
+                {/* Debug Section */}
+                <div className="mt-4 p-4 bg-blue-50 border border-blue-200 rounded-lg">
+                  <details>
+                    <summary className="cursor-pointer font-medium text-blue-800 mb-2">
+                      🔍 Debug Info (Click to expand)
+                    </summary>
+                    <div className="text-sm text-blue-700 space-y-2">
+                      <p><strong>Total transactions found:</strong> {transactions.length}</p>
+                      <p><strong>Income transactions:</strong> {transactions.filter(t => t.isIncome).length}</p>
+                      <p><strong>Expense transactions:</strong> {transactions.filter(t => !t.isIncome && t.amount < 0).length}</p>
+                      <p><strong>Transfer transactions:</strong> {transactions.filter(t => t.isTransfer).length}</p>
+                      
+                      {transactions.length > 0 && (
+                        <div className="mt-3">
+                          <p><strong>Sample transactions:</strong></p>
+                          <div className="bg-white p-2 rounded border max-h-40 overflow-y-auto">
+                            {transactions.slice(0, 5).map((t, i) => (
+                              <div key={i} className="text-xs py-1 border-b last:border-b-0">
+                                {t.date} | {t.description.substring(0, 30)}... | R{t.amount} | {t.category}
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                      
+                      <p className="text-xs text-blue-600 mt-2">
+                        💡 If transactions aren't appearing correctly, check the browser console (F12) for detailed parsing logs
+                      </p>
+                    </div>
+                  </details>
                 </div>
               </div>
             )}
