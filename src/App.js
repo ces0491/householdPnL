@@ -131,6 +131,266 @@ const BankStatementAnalyzer = () => {
     return false;
   }, [isInterAccountTransfer]);
 
+  // Categorize transaction based on description
+  const categorizeTransaction = useCallback((description) => {
+    const desc = description.toUpperCase();
+    
+    for (const [category, keywords] of Object.entries(EXPENSE_CATEGORIES)) {
+      if (keywords.some(keyword => desc.includes(keyword.toUpperCase()))) {
+        return category;
+      }
+    }
+    
+    return 'Other';
+  }, []);
+
+  // Helper function to check if a row is a header
+  const isHeaderRow = useCallback((rowText) => {
+    const headerKeywords = [
+      'date', 'description', 'amount', 'balance', 'debit', 'credit',
+      'transaction', 'reference', 'details', 'account', 'statement'
+    ];
+    const lowerText = rowText.toLowerCase();
+    return headerKeywords.some(keyword => lowerText.includes(keyword)) && 
+           rowText.length < 50; // Headers are usually short
+  }, []);
+
+  // Enhanced amount parsing
+  const parseAmount = useCallback((amountStr) => {
+    // Remove currency symbols and clean up
+    let cleaned = amountStr
+      .replace(/[R\s$€£¥]/gi, '') // Remove currency symbols
+      .replace(/[,\s]/g, '') // Remove thousands separators and spaces
+      .trim();
+    
+    // Handle negative indicators
+    let isNegative = false;
+    if (cleaned.includes('-') || amountStr.toLowerCase().includes('dr')) {
+      isNegative = true;
+      cleaned = cleaned.replace(/[-]/g, '');
+    }
+    
+    const numericAmount = parseFloat(cleaned);
+    return isNegative ? -numericAmount : numericAmount;
+  }, []);
+
+  // Standardize date format
+  const standardizeDate = useCallback((dateStr) => {
+    try {
+      // Try different date parsing approaches
+      let date;
+      
+      if (/^\d{1,2}[-\/\s]\d{1,2}[-\/\s]\d{4}$/.test(dateStr)) {
+        // DD/MM/YYYY format (South African standard)
+        const parts = dateStr.split(/[-\/\s]/);
+        date = new Date(parts[2], parts[1] - 1, parts[0]);
+      } else {
+        // Try native parsing
+        date = new Date(dateStr);
+      }
+      
+      if (isNaN(date)) {
+        console.warn('Could not parse date:', dateStr);
+        return dateStr; // Return original if parsing fails
+      }
+      
+      return date.toISOString().split('T')[0]; // Return YYYY-MM-DD format
+    } catch (error) {
+      console.warn('Date parsing error:', error, dateStr);
+      return dateStr;
+    }
+  }, []);
+
+  // Parse positioned text items into transactions
+  const parsePositionedText = useCallback((textItems, pageNum) => {
+    const transactions = [];
+    
+    // Sort items by Y position (top to bottom), then by X position (left to right)
+    const sortedItems = textItems.sort((a, b) => {
+      if (Math.abs(a.y - b.y) < 5) { // Same row (within 5 pixels)
+        return a.x - b.x; // Sort by X position
+      }
+      return b.y - a.y; // Sort by Y position (higher Y first)
+    });
+    
+    // Group items by rows (items with similar Y coordinates)
+    const rows = [];
+    let currentRow = [];
+    let lastY = null;
+    
+    sortedItems.forEach(item => {
+      if (lastY === null || Math.abs(item.y - lastY) < 5) {
+        // Same row
+        currentRow.push(item);
+      } else {
+        // New row
+        if (currentRow.length > 0) {
+          rows.push([...currentRow]);
+        }
+        currentRow = [item];
+      }
+      lastY = item.y;
+    });
+    
+    // Add the last row
+    if (currentRow.length > 0) {
+      rows.push(currentRow);
+    }
+    
+    console.log(`Page ${pageNum} - Rows found:`, rows.length);
+    
+    // Enhanced patterns for different date formats
+    const datePatterns = [
+      /^\d{1,2}[-\/\s]\d{1,2}[-\/\s]\d{4}$/, // DD/MM/YYYY, DD-MM-YYYY, DD MM YYYY
+      /^\d{4}[-\/\s]\d{1,2}[-\/\s]\d{1,2}$/, // YYYY/MM/DD, YYYY-MM-DD
+      /^\d{1,2}\s+\w{3}\s+\d{4}$/, // DD MMM YYYY
+      /^\w{3}\s+\d{1,2},?\s+\d{4}$/, // MMM DD, YYYY
+      /^\d{1,2}\s+\w+\s+\d{4}$/ // DD Month YYYY
+    ];
+    
+    // Enhanced amount patterns
+    const amountPatterns = [
+      /^[\-\+]?\s*R?\s*\d{1,3}(?:[,\s]\d{3})*(?:\.\d{2})?$/, // R1,234.56 or 1,234.56
+      /^\d{1,3}(?:[,\s]\d{3})*\.\d{2}$/, // 1,234.56
+      /^\d+\.\d{2}$/ // Simple 123.45
+    ];
+    
+    // Process each row to find transaction data
+    rows.forEach((row, rowIndex) => {
+      if (row.length < 3) return; // Need at least 3 items for a transaction
+      
+      const rowText = row.map(item => item.text).join(' ');
+      
+      // Skip header rows and non-transaction rows
+      if (isHeaderRow(rowText) || rowText.length < 10) return;
+      
+      // Find date in the row
+      let dateText = '';
+      let dateIndex = -1;
+      
+      for (let i = 0; i < row.length; i++) {
+        const text = row[i].text;
+        if (datePatterns.some(pattern => pattern.test(text))) {
+          dateText = text;
+          dateIndex = i;
+          break;
+        }
+      }
+      
+      if (!dateText) return; // No date found, skip row
+      
+      // Find amounts in the row
+      const amounts = [];
+      const descriptions = [];
+      
+      row.forEach((item, index) => {
+        const text = item.text;
+        
+        // Check if it's an amount
+        if (amountPatterns.some(pattern => pattern.test(text))) {
+          const cleanAmount = parseAmount(text);
+          if (!isNaN(cleanAmount) && Math.abs(cleanAmount) > 0.01) {
+            amounts.push({
+              value: cleanAmount,
+              position: item.x,
+              original: text
+            });
+          }
+        } 
+        // Otherwise, it might be part of description
+        else if (index !== dateIndex && text.length > 1 && !text.match(/^\d+$/)) {
+          descriptions.push(text);
+        }
+      });
+      
+      if (amounts.length === 0) return; // No amounts found
+      
+      // Create transactions for each amount found
+      amounts.forEach(amount => {
+        const description = descriptions.join(' ').trim() || 'Transaction';
+        
+        // Determine if it's income or expense based on context and amount
+        const isIncomeTransaction = amount.value > 0 && isIncome(description, amount.value);
+        
+        const transaction = {
+          date: standardizeDate(dateText),
+          description: description.substring(0, 100),
+          amount: amount.value,
+          type: amount.value >= 0 ? 'credit' : 'debit',
+          category: isIncomeTransaction ? 'Income' : categorizeTransaction(description),
+          isIncome: isIncomeTransaction,
+          isTransfer: isInterAccountTransfer(description),
+          source: `Page ${pageNum}, Row ${rowIndex + 1}`,
+          rawData: rowText
+        };
+        
+        transactions.push(transaction);
+        
+        console.log(`Transaction found: ${transaction.date} | ${description.substring(0, 20)}... | ${amount.value} | ${amount.original}`);
+      });
+    });
+    
+    return transactions;
+  }, [isHeaderRow, parseAmount, standardizeDate, isIncome, categorizeTransaction, isInterAccountTransfer]);
+
+  // Enhanced PDF parser using positioned text extraction
+  const parsePDFStatement = useCallback(async (file) => {
+    try {
+      // Load PDF.js if not already loaded
+      if (!window.pdfjsLib) {
+        await new Promise((resolve, reject) => {
+          const script = document.createElement('script');
+          script.src = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js';
+          script.onload = resolve;
+          script.onerror = reject;
+          document.head.appendChild(script);
+        });
+        window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+      }
+
+      const arrayBuffer = await file.arrayBuffer();
+      const pdf = await window.pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+      
+      console.log('=== ENHANCED PDF PARSING DEBUG ===');
+      console.log('PDF loaded, pages:', pdf.numPages);
+      
+      let allTransactions = [];
+      
+      // Process each page
+      for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+        const page = await pdf.getPage(pageNum);
+        const textContent = await page.getTextContent();
+        
+        console.log(`\nPage ${pageNum}:`);
+        console.log('Text items found:', textContent.items.length);
+        
+        // Extract positioned text items instead of raw text
+        const textItems = textContent.items.map(item => ({
+          text: item.str.trim(),
+          x: Math.round(item.transform[4]), // X position
+          y: Math.round(item.transform[5]), // Y position
+          width: Math.round(item.width),
+          height: Math.round(item.height)
+        })).filter(item => item.text.length > 0);
+        
+        console.log('Processed text items:', textItems.length);
+        
+        // Parse transactions from positioned text
+        const pageTransactions = parsePositionedText(textItems, pageNum);
+        allTransactions.push(...pageTransactions);
+        
+        console.log(`Page ${pageNum} transactions found:`, pageTransactions.length);
+      }
+      
+      console.log('Total transactions found:', allTransactions.length);
+      return allTransactions;
+      
+    } catch (error) {
+      console.error('Enhanced PDF parsing error:', error);
+      throw new Error(`Failed to parse PDF: ${error.message}`);
+    }
+  }, [parsePositionedText]);
+
   // Add manual entry
   const addManualEntry = useCallback(() => {
     if (!newEntry.date || !newEntry.description || !newEntry.amount) return;
@@ -158,233 +418,6 @@ const BankStatementAnalyzer = () => {
     setManualEntries(prev => prev.filter(entry => entry.id !== id));
   }, []);
 
-  // Categorize transaction based on description
-  const categorizeTransaction = useCallback((description) => {
-    const desc = description.toUpperCase();
-    
-    for (const [category, keywords] of Object.entries(EXPENSE_CATEGORIES)) {
-      if (keywords.some(keyword => desc.includes(keyword.toUpperCase()))) {
-        return category;
-      }
-    }
-    
-    return 'Other';
-  }, []);
-
-  // Parse transactions from extracted PDF text
-  const parseTransactionsFromText = useCallback((text) => {
-    console.log('=== PDF PARSING DEBUG ===');
-    console.log('Extracted text length:', text.length);
-    console.log('First 500 characters:', text.substring(0, 500));
-    
-    const transactions = [];
-    const lines = text.split('\n').filter(line => line.trim());
-    console.log('Total lines:', lines.length);
-    
-    // Enhanced date patterns for South African banks
-    const datePatterns = [
-      /(\d{1,2}[-\/]\d{1,2}[-\/]\d{4})/g,     // DD/MM/YYYY or D/M/YYYY
-      /(\d{4}[-\/]\d{1,2}[-\/]\d{1,2})/g,     // YYYY/MM/DD or YYYY/M/D
-      /(\d{1,2}\s\w{3}\s\d{4})/g,             // DD MMM YYYY or D MMM YYYY
-      /(\w{3}\s\d{1,2},?\s\d{4})/g,           // MMM DD, YYYY
-      /(\d{1,2}\s\w+\s\d{4})/g                // DD Month YYYY
-    ];
-
-    // Enhanced amount patterns for SA banking
-    const amountPatterns = [
-      /([\-\+]?\s*R\s*\d{1,3}(?:[,\s]\d{3})*(?:\.\d{2})?)/gi,     // R1,234.56 or R 1 234.56
-      /([\-\+]?\s*\d{1,3}(?:[,\s]\d{3})*\.\d{2})/g,               // 1,234.56 or 1 234.56
-      /([\-\+]?\s*\d{1,6}\.\d{2})/g,                               // Simple 1234.56
-      /(\d{1,3}(?:[,\s]\d{3})*(?:\.\d{2})?\s*(?:CR|DR))/gi        // 1,234.56 CR/DR
-    ];
-
-    let debugInfo = [];
-
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i].trim();
-      if (!line || line.length < 5) continue;
-
-      // Look for date patterns
-      let dateMatch = null;
-      let matchedPattern = null;
-      
-      for (let p = 0; p < datePatterns.length; p++) {
-        const pattern = datePatterns[p];
-        const match = line.match(pattern);
-        if (match) {
-          dateMatch = match[0];
-          matchedPattern = p;
-          break;
-        }
-      }
-
-      if (dateMatch) {
-        debugInfo.push(`Line ${i}: Found date "${dateMatch}" in: ${line}`);
-        
-        // Parse the date to standard format
-        let parsedDate = '';
-        try {
-          if (matchedPattern === 0) {
-            // DD/MM/YYYY or D/M/YYYY
-            const parts = dateMatch.split(/[-\/]/);
-            if (parts.length === 3) {
-              parsedDate = `${parts[2]}-${parts[1].padStart(2, '0')}-${parts[0].padStart(2, '0')}`;
-            }
-          } else if (matchedPattern === 1) {
-            // YYYY/MM/DD
-            parsedDate = dateMatch.replace(/[\/]/g, '-');
-          } else {
-            // Try to parse as a date directly
-            const date = new Date(dateMatch);
-            if (!isNaN(date)) {
-              parsedDate = date.toISOString().split('T')[0];
-            }
-          }
-        } catch (e) {
-          console.warn('Date parsing error:', e);
-          continue;
-        }
-
-        if (!parsedDate) {
-          debugInfo.push(`Failed to parse date: ${dateMatch}`);
-          continue;
-        }
-
-        // Look for amounts in this line and surrounding lines
-        const searchLines = [line, ...lines.slice(i + 1, i + 3), ...lines.slice(Math.max(0, i - 1), i)];
-        let description = '';
-        let amount = 0;
-        let foundAmount = false;
-        let amountString = '';
-
-        for (const searchLine of searchLines) {
-          let workingLine = searchLine.replace(dateMatch, '').trim();
-          
-          for (const amountPattern of amountPatterns) {
-            const amountMatches = workingLine.match(amountPattern);
-            if (amountMatches && !foundAmount) {
-              for (const amountStr of amountMatches) {
-                // Clean and parse amount
-                let cleanAmount = amountStr
-                  .replace(/[R\s]/gi, '')
-                  .replace(/[,\s]/g, '')
-                  .replace(/CR$/i, '')
-                  .replace(/DR$/i, '');
-                
-                // Handle negative amounts (DR or explicit -)
-                let isNegative = /DR$/i.test(amountStr) || amountStr.includes('-');
-                
-                const numericAmount = parseFloat(cleanAmount);
-                if (!isNaN(numericAmount) && numericAmount > 0) {
-                  amount = isNegative ? -numericAmount : numericAmount;
-                  foundAmount = true;
-                  amountString = amountStr;
-                  
-                  // Remove amount from description
-                  workingLine = workingLine.replace(amountStr, '').trim();
-                  break;
-                }
-              }
-            }
-          }
-          
-          // Build description from non-amount text
-          if (workingLine && workingLine.length > 2) {
-            // Clean up common bank statement artifacts
-            workingLine = workingLine
-              .replace(/\s+/g, ' ')
-              .replace(/^\s*[:\-\*\.]+\s*/, '')
-              .replace(/\s*[:\-\*\.]+\s*$/, '')
-              .trim();
-              
-            if (workingLine.length > 2) {
-              description += (description ? ' ' : '') + workingLine;
-            }
-          }
-          
-          if (foundAmount && description) break;
-        }
-
-        // Only add transaction if we found both description and amount
-        if (foundAmount && description && description.length > 3) {
-          const transaction = {
-            date: parsedDate,
-            description: description.trim().substring(0, 100), // Limit description length
-            amount: amount,
-            type: amount >= 0 ? 'credit' : 'debit',
-            category: isIncome(description, amount) ? 'Income' : categorizeTransaction(description),
-            isIncome: isIncome(description, amount),
-            isTransfer: isInterAccountTransfer(description)
-          };
-          
-          transactions.push(transaction);
-          debugInfo.push(`Created transaction: ${parsedDate} | ${description.substring(0, 30)}... | ${amount} | ${amountString}`);
-        } else {
-          debugInfo.push(`Skipped line ${i}: date=${dateMatch}, description="${description}", amount=${amount}, foundAmount=${foundAmount}`);
-        }
-      }
-    }
-
-    // Remove duplicates
-    const cleanedTransactions = transactions.filter((t, index, self) => {
-      if (Math.abs(t.amount) < 0.01) return false;
-      
-      const duplicate = self.findIndex(other => 
-        other.date === t.date && 
-        other.description === t.description && 
-        Math.abs(other.amount - t.amount) < 0.01
-      );
-      
-      return duplicate === index;
-    });
-
-    console.log('Debug info:', debugInfo);
-    console.log('Raw transactions found:', transactions.length);
-    console.log('Cleaned transactions:', cleanedTransactions.length);
-    console.log('Sample transactions:', cleanedTransactions.slice(0, 3));
-
-    return cleanedTransactions;
-  }, [categorizeTransaction, isIncome, isInterAccountTransfer]);
-
-  // Parse PDF statement using PDF.js
-  const parsePDFStatement = useCallback(async (file) => {
-    try {
-      // Load PDF.js from CDN
-      if (!window.pdfjsLib) {
-        await new Promise((resolve, reject) => {
-          const script = document.createElement('script');
-          script.src = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js';
-          script.onload = resolve;
-          script.onerror = reject;
-          document.head.appendChild(script);
-        });
-        window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
-      }
-
-      // Read file as array buffer
-      const arrayBuffer = await file.arrayBuffer();
-      
-      // Load PDF document
-      const pdf = await window.pdfjsLib.getDocument({ data: arrayBuffer }).promise;
-      let fullText = '';
-      
-      // Extract text from all pages
-      for (let i = 1; i <= pdf.numPages; i++) {
-        const page = await pdf.getPage(i);
-        const textContent = await page.getTextContent();
-        const pageText = textContent.items.map(item => item.str).join(' ');
-        fullText += pageText + '\n';
-      }
-
-      // Parse transactions from extracted text
-      return parseTransactionsFromText(fullText);
-      
-    } catch (error) {
-      console.error('Error parsing PDF:', error);
-      throw new Error(`Failed to parse PDF: ${error.message}`);
-    }
-  }, [parseTransactionsFromText]);
-
   // Deduplicate transactions
   const deduplicateTransactions = useCallback((transactions) => {
     const seen = new Set();
@@ -408,9 +441,12 @@ const BankStatementAnalyzer = () => {
       
       for (const file of files) {
         try {
+          console.log(`Processing file: ${file.name}`);
           const parsed = await parsePDFStatement(file);
           newTransactions.push(...parsed);
+          console.log(`Successfully parsed ${parsed.length} transactions from ${file.name}`);
         } catch (error) {
+          console.error(`Error parsing ${file.name}:`, error);
           errors.push(`Error parsing ${file.name}: ${error.message}`);
         }
       }
@@ -727,11 +763,11 @@ const BankStatementAnalyzer = () => {
                   ))}
                 </div>
                 
-                {/* Debug Section */}
+                {/* Enhanced Debug Section */}
                 <div className="mt-4 p-4 bg-blue-50 border border-blue-200 rounded-lg">
                   <details>
                     <summary className="cursor-pointer font-medium text-blue-800 mb-2">
-                      🔍 Debug Info (Click to expand)
+                      🔍 Enhanced Parser Debug Info (Click to expand)
                     </summary>
                     <div className="text-sm text-blue-700 space-y-2">
                       <p><strong>Total transactions found:</strong> {transactions.length}</p>
@@ -743,9 +779,9 @@ const BankStatementAnalyzer = () => {
                         <div className="mt-3">
                           <p><strong>Sample transactions:</strong></p>
                           <div className="bg-white p-2 rounded border max-h-40 overflow-y-auto">
-                            {transactions.slice(0, 5).map((t, i) => (
+                            {transactions.slice(0, 10).map((t, i) => (
                               <div key={i} className="text-xs py-1 border-b last:border-b-0">
-                                {t.date} | {t.description.substring(0, 30)}... | R{t.amount} | {t.category}
+                                {t.date} | {t.description.substring(0, 30)}... | R{t.amount} | {t.category} | {t.source || 'Old parser'}
                               </div>
                             ))}
                           </div>
@@ -753,7 +789,7 @@ const BankStatementAnalyzer = () => {
                       )}
                       
                       <p className="text-xs text-blue-600 mt-2">
-                        💡 If transactions aren't appearing correctly, check the browser console (F12) for detailed parsing logs
+                        💡 The enhanced parser uses positioned text extraction for better table recognition. Check browser console (F12) for detailed parsing logs.
                       </p>
                     </div>
                   </details>
@@ -923,6 +959,7 @@ const BankStatementAnalyzer = () => {
                               <div className="flex-1">
                                 <div className="font-medium text-gray-900">{transaction.description}</div>
                                 <div className="text-sm text-green-600 font-medium">{transaction.category || 'Income'}</div>
+                                {transaction.source && <div className="text-xs text-gray-400">{transaction.source}</div>}
                               </div>
                             </div>
                             <div className="text-right">
@@ -1014,6 +1051,7 @@ const BankStatementAnalyzer = () => {
                                       <div className="text-sm text-gray-500 w-24 font-mono">{transaction.date}</div>
                                       <div className="flex-1">
                                         <div className="font-medium text-gray-900">{transaction.description}</div>
+                                        {transaction.source && <div className="text-xs text-gray-400">{transaction.source}</div>}
                                       </div>
                                     </div>
                                     <div className="text-right">
