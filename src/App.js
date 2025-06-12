@@ -189,26 +189,27 @@ const PatternDetector = {
 };
 
 // Enhanced Transaction Detection Module  
+// Enhanced Transaction Detection Module with Conservative Parsing
 const TransactionDetector = {
   isHeaderRow(rowText) {
     const headerKeywords = [
       'date', 'description', 'amount', 'balance', 'debit', 'credit',
       'transaction', 'reference', 'details', 'account', 'statement',
-      'opening', 'closing', 'brought forward', 'carried forward'
+      'opening', 'closing', 'brought forward', 'carried forward',
+      'customer care', 'website', 'standard bank', 'account holder'
     ];
     const lowerText = rowText.toLowerCase();
     const hasHeaderKeyword = headerKeywords.some(keyword => lowerText.includes(keyword));
-    const isShort = rowText.length < 100;
     
-    return hasHeaderKeyword && isShort;
+    return hasHeaderKeyword;
   },
 
+  // More conservative transaction detection
   detectTransactionInRow(row, rowIndex, pageNum) {
     const rowText = row.map(item => item.text).join(' ');
     
     console.log(`\n--- Analyzing Row ${rowIndex + 1} on Page ${pageNum} ---`);
     console.log(`Row text: "${rowText}"`);
-    console.log(`Row items:`, row.map(item => `"${item.text}"`));
     
     // Skip obviously non-transaction rows
     if (this.isHeaderRow(rowText)) {
@@ -216,141 +217,103 @@ const TransactionDetector = {
       return null;
     }
     
-    if (rowText.length < 5) {  // Reduced from 10
-      console.log(`❌ Skipped: Too short (${rowText.length} chars)`);
+    if (rowText.length < 10 || row.length < 3) {
+      console.log(`❌ Skipped: Too simple (${rowText.length} chars, ${row.length} items)`);
       return null;
     }
     
-    if (row.length < 2) {  // Need at least 2 items
-      console.log(`❌ Skipped: Too few items (${row.length})`);
+    // Look for typical Standard Bank transaction patterns
+    const hasDatePattern = row.some(item => 
+      /^\d{1,2}\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)/.test(item.text) ||
+      /^\d{4}$/.test(item.text) // Year
+    );
+    
+    if (!hasDatePattern) {
+      console.log(`❌ Skipped: No clear date pattern`);
       return null;
     }
     
-    // Find dates and amounts in the row
-    const dates = [];
-    const amounts = [];
+    // Find transaction amounts - be more selective
+    const transactionAmounts = [];
     const descriptions = [];
+    const dates = [];
     
     row.forEach((item, index) => {
       const text = item.text.trim();
       
+      // Date detection
       if (PatternDetector.isDate(text)) {
-        dates.push({ text, index, item });
-        console.log(`📅 Found date: "${text}" at position ${index}`);
-      } else if (PatternDetector.isAmount(text)) {
+        dates.push({ text, index });
+      }
+      
+      // Amount detection - be more conservative
+      if (PatternDetector.isAmount(text)) {
         const amount = PatternDetector.parseAmount(text);
-        if (amount !== null) {
-          amounts.push({ value: amount, text, index, item });
-          console.log(`💰 Found amount: "${text}" = ${amount} at position ${index}`);
+        if (amount !== null && Math.abs(amount) >= 1 && Math.abs(amount) <= 500000) {
+          // Reasonable transaction limits
+          transactionAmounts.push({ value: amount, text, index });
+          console.log(`💰 Found reasonable amount: "${text}" = ${amount}`);
         }
-      } else if (text.length > 1 && !text.match(/^\d+$/) && !text.match(/^[A-Z]{1,3}$/)) {
-        descriptions.push({ text, index, item });
+      }
+      
+      // Description items
+      if (text.length > 2 && !PatternDetector.isDate(text) && !PatternDetector.isAmount(text)) {
+        descriptions.push({ text, index });
       }
     });
     
-    console.log(`📊 Analysis: ${dates.length} dates, ${amounts.length} amounts, ${descriptions.length} descriptions`);
+    console.log(`📊 Found: ${dates.length} dates, ${transactionAmounts.length} amounts, ${descriptions.length} descriptions`);
     
-    // More flexible requirements
-    let hasDateLikeText = dates.length > 0;
-    let hasAmountLikeText = amounts.length > 0;
-    
-    // If no explicit dates found, look for number-like patterns that could be dates
-    if (!hasDateLikeText) {
-      const possibleDates = row.filter(item => 
-        /\d/.test(item.text) && 
-        item.text.length >= 2 && 
-        item.text.length <= 10
-      );
-      if (possibleDates.length > 0) {
-        console.log(`🔍 Possible date candidates:`, possibleDates.map(d => d.text));
-        // Use first number-like text as potential date
-        hasDateLikeText = true;
-        dates.push({ text: possibleDates[0].text, index: 0, item: possibleDates[0] });
-      }
-    }
-    
-    // If no explicit amounts found, look for any numbers
-    if (!hasAmountLikeText) {
-      const possibleAmounts = row.filter(item => {
-        const text = item.text.replace(/[^\d\.\-]/g, '');
-        return /^\d+\.?\d*$/.test(text) && parseFloat(text) > 0;
-      });
-      if (possibleAmounts.length > 0) {
-        console.log(`🔍 Possible amount candidates:`, possibleAmounts.map(a => a.text));
-        possibleAmounts.forEach(item => {
-          const amount = parseFloat(item.text.replace(/[^\d\.\-]/g, ''));
-          if (!isNaN(amount) && amount > 0) {
-            amounts.push({ value: amount, text: item.text, index: 0, item });
-            hasAmountLikeText = true;
-          }
-        });
-      }
-    }
-    
-    // Require at least some structured data
-    if (!hasDateLikeText && !hasAmountLikeText) {
-      console.log(`❌ Rejected: No dates or amounts found`);
+    // Require at least one amount to create a transaction
+    if (transactionAmounts.length === 0) {
+      console.log(`❌ Rejected: No valid amounts found`);
       return null;
     }
     
-    if (descriptions.length === 0 && rowText.length > 5) {
-      // Use the entire row text as description if no specific description items
-      descriptions.push({ text: rowText, index: 0, item: row[0] });
-    }
+    // Use first/best date
+    const primaryDate = dates.length > 0 ? dates[0].text : 'Unknown';
     
-    // Create transaction(s)
-    const transactions = [];
-    const primaryDate = dates.length > 0 ? dates[0] : { text: 'Unknown', index: 0 };
-    const description = descriptions.map(d => d.text).join(' ').trim() || rowText.trim() || 'Transaction';
+    // Build description from non-amount items
+    const description = descriptions
+      .filter(d => d.text.length > 2)
+      .map(d => d.text)
+      .join(' ')
+      .substring(0, 100)
+      .trim() || 'Transaction';
     
-    if (amounts.length === 0) {
-      // Create a transaction even without explicit amounts for debugging
-      amounts.push({ value: 0, text: 'N/A', index: 0 });
-    }
+    // Only create ONE transaction per row (use the most significant amount)
+    const bestAmount = transactionAmounts.sort((a, b) => Math.abs(b.value) - Math.abs(a.value))[0];
     
-    amounts.forEach(amount => {
-      const transaction = {
-        date: PatternDetector.standardizeDate(primaryDate.text),
-        description: description.substring(0, 100),
-        amount: amount.value,
-        type: amount.value >= 0 ? 'credit' : 'debit',
-        source: `Page ${pageNum}, Row ${rowIndex + 1}`,
-        rawData: rowText,
-        debug: {
-          dateFound: primaryDate.text,
-          amountFound: amount.text,
-          descriptionItems: descriptions.length,
-          originalRow: row.map(item => item.text)
-        }
-      };
-      
-      transactions.push(transaction);
-      console.log(`✅ Created transaction: ${transaction.date} | ${description.substring(0, 20)}... | ${amount.value}`);
-    });
+    const transaction = {
+      date: PatternDetector.standardizeDate(primaryDate),
+      description: description,
+      amount: bestAmount.value,
+      type: bestAmount.value >= 0 ? 'credit' : 'debit',
+      source: `Page ${pageNum}, Row ${rowIndex + 1}`,
+      rawData: rowText.substring(0, 200),
+      debug: {
+        originalAmounts: transactionAmounts.map(a => a.text),
+        selectedAmount: bestAmount.text,
+        dateFound: primaryDate
+      }
+    };
     
-    return transactions.length === 1 ? transactions[0] : transactions;
+    console.log(`✅ Created transaction: ${transaction.date} | ${description.substring(0, 30)}... | R${bestAmount.value}`);
+    return transaction;
   },
 
   parseTransactionsFromRows(rows, pageNum) {
-    console.log(`\n=== TRANSACTION DETECTION PAGE ${pageNum} ===`);
+    console.log(`\n=== CONSERVATIVE TRANSACTION DETECTION PAGE ${pageNum} ===`);
     const transactions = [];
-    
-    // Enhanced debugging - show sample rows
-    TextProcessor.debugRows(rows, pageNum, 10);
     
     rows.forEach((row, rowIndex) => {
       const result = this.detectTransactionInRow(row, rowIndex, pageNum);
-      
       if (result) {
-        if (Array.isArray(result)) {
-          transactions.push(...result);
-        } else {
-          transactions.push(result);
-        }
+        transactions.push(result);
       }
     });
     
-    console.log(`📈 Page ${pageNum} final result: ${transactions.length} transactions found`);
+    console.log(`📈 Page ${pageNum} conservative result: ${transactions.length} transactions found`);
     return transactions;
   }
 };
